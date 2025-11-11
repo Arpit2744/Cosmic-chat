@@ -89,7 +89,8 @@ $("#join").addEventListener("click", async () => {
   }catch(e){ console.error(e); }
 
   const qs = new URLSearchParams({ name: state.name, password: state.password || "" });
-  ws = new WebSocket(`ws://${location.host}/ws/${encodeURIComponent(state.room)}?${qs.toString()}`);
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${protocol}://${location.host}/ws/${encodeURIComponent(state.room)}?${qs.toString()}`);
   ws.onmessage = async (ev) => {
     const data = JSON.parse(ev.data);
     if (data.type === "users") updateUsers(data.list);
