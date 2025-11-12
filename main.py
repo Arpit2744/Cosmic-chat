@@ -74,15 +74,38 @@ async def history(room_id: str, limit: int = 50):
         payload = [dict(r) for r in rows][::-1]
     return {"messages": payload}
 
+@app.get("/rooms")
+async def list_rooms():
+    # Build a summary of all rooms currently in memory
+    data = []
+    for room_id, info in rooms.items():
+        data.append({
+            "room_id": room_id,
+            "users": len(info["clients"]),
+            "names": sorted(list(info["names"])),
+            "locked": bool(info["password"]),
+        })
+    return {"active_rooms": data}
+
 def get_or_create_room(room_id: str, password: str | None):
+    # Normalize empty passwords to None
+    if password is not None and password.strip() == "":
+        password = None
+
     room = rooms.get(room_id)
     if room is None:
         rooms[room_id] = {"password": password or "", "clients": set(), "names": set()}
         return rooms[room_id]
-    if room["password"] and password != room["password"]:
-        raise HTTPException(status_code=403, detail="Invalid room password.")
-    if not room["password"] and password:
-        room["password"] = password
+
+    # Only check password if the room actually has one set
+    if room["password"]:
+        if not password or password != room["password"]:
+            raise HTTPException(status_code=403, detail="Invalid room password.")
+    else:
+        # If the existing room has no password and a new one is supplied, lock it
+        if password:
+            room["password"] = password
+
     return room
 
 async def broadcast(room_id: str, message: str, exclude: WebSocket | None = None):
