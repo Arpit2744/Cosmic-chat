@@ -165,6 +165,17 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, name: str = Query(...)
                 await broadcast(room_id, json.dumps({"type": "seen", "messageId": data.get("messageId"), "by": name}), exclude=websocket)
                 continue
 
+            # --- WebRTC Signaling for Voice Chat ---
+            if t in ("webrtc-offer", "webrtc-answer", "webrtc-ice"):
+            # Forward WebRTC signaling data to all other peers in the room
+                await broadcast(room_id, json.dumps({
+                    "type": t,
+                    "from": name,
+                    "payload": data.get("payload")
+                }), exclude=websocket)
+                continue
+            # --- End WebRTC block ---
+
             if t == "message":
                 text = data.get("text", "")
                 ts = data.get("ts", "")

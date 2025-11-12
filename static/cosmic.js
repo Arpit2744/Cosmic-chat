@@ -6,7 +6,38 @@ const presenceEl = $("#presence");
 const usersListEl = $("#users-list");
 const messageInput = $("#message");
 
+let pc = null;
+let localStream = null;
+let remoteAudio = null;
 let ws = null;
+// === Voice Call Setup ===
+const callBtn = document.getElementById("call");
+remoteAudio = document.getElementById("remoteAudio");
+
+callBtn.addEventListener("click", async () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    alert("You must join a room first!");
+    return;
+  }
+  if (pc) return; // already on call
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+  localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  pc.ontrack = (event) => {
+    remoteAudio.srcObject = event.streams[0];
+  };
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({ type: "webrtc-ice", payload: event.candidate }));
+    }
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({ type: "webrtc-offer", payload: offer }));
+});
+
 let state = { room:"", name:"", password:"", e2e:false, key:null, typingTimeout:null, myMsgs:new Map() };
 
 function tsNow(){ return new Date().toISOString(); }
@@ -64,49 +95,110 @@ $("#join").addEventListener("click", async () => {
   state.name = $("#name").value.trim();
   state.password = $("#password").value;
   state.e2e = $("#use-e2e").checked;
-  if (!state.room || !state.name){ alert("Room and Nickname required."); return; }
-  if (state.e2e && !state.password){ alert("Set a shared password for E2E."); return; }
-  if (state.e2e){ state.key = await deriveKey(state.password, state.room); }
+  if (!state.room || !state.name) { alert("Room and Nickname required."); return; }
+  if (state.e2e && !state.password) { alert("Set a shared password for E2E."); return; }
+  if (state.e2e) { state.key = await deriveKey(state.password, state.room); }
 
   $("#join-card").classList.add("hidden");
   $("#chat-card").classList.remove("hidden");
   roomTitle.textContent = `Room ${state.room}`;
   if (Notification.permission !== "granted") Notification.requestPermission();
 
-  // history
-  try{
+  // Load message history
+  try {
     const res = await fetch(`/history/${encodeURIComponent(state.room)}?limit=60`);
     const data = await res.json();
-    for(const m of data.messages){
-      if (m.mtype === "file"){
-        appendFileBubble({name:m.sender, data:m.message, filename:m.filename, ts:m.ts, self:m.sender===state.name});
+    for (const m of data.messages) {
+      if (m.mtype === "file") {
+        appendFileBubble({
+          name: m.sender,
+          data: m.message,
+          filename: m.filename,
+          ts: m.ts,
+          self: m.sender === state.name
+        });
       } else {
         let text = m.message;
-        if (m.encrypted){ text = state.key ? await decryptMaybe(state.key, text) : "[Encrypted message]"; }
-        appendTextBubble({name:m.sender, text, ts:m.ts, self:m.sender===state.name});
+        if (m.encrypted) {
+          text = state.key ? await decryptMaybe(state.key, text) : "[Encrypted message]";
+        }
+        appendTextBubble({ name: m.sender, text, ts: m.ts, self: m.sender === state.name });
       }
     }
-  }catch(e){ console.error(e); }
+  } catch (e) { console.error(e); }
 
   const qs = new URLSearchParams({ name: state.name, password: state.password || "" });
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${protocol}://${location.host}/ws/${encodeURIComponent(state.room)}?${qs.toString()}`);
+
   ws.onmessage = async (ev) => {
     const data = JSON.parse(ev.data);
+
+    // === Handle incoming WebRTC (voice call) signals ===
+    if (["webrtc-offer", "webrtc-answer", "webrtc-ice"].includes(data.type)) {
+      if (!pc) {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        pc.ontrack = (event) => { remoteAudio.srcObject = event.streams[0]; };
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            ws.send(JSON.stringify({ type: "webrtc-ice", payload: event.candidate }));
+          }
+        };
+      }
+
+      if (data.type === "webrtc-offer") {
+        await pc.setRemoteDescription(new RTCSessionDescription(data.payload));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: "webrtc-answer", payload: answer }));
+      } else if (data.type === "webrtc-answer") {
+        await pc.setRemoteDescription(new RTCSessionDescription(data.payload));
+      } else if (data.type === "webrtc-ice") {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(data.payload));
+        } catch (err) {
+          console.error("Error adding ICE candidate", err);
+        }
+      }
+      return; // skip normal chat logic
+    }
+
+    // === Normal chat handling ===
     if (data.type === "users") updateUsers(data.list);
-    else if (data.type === "presence"){ presenceEl.textContent = `${data.name} ${data.event}`; setTimeout(()=>presenceEl.textContent="",1200); }
-    else if (data.type === "typing"){ typingEl.classList.remove("hidden"); clearTimeout(state.typingTimeout); state.typingTimeout=setTimeout(()=>typingEl.classList.add("hidden"), 800); }
-    else if (data.type === "message"){
+    else if (data.type === "presence") {
+      presenceEl.textContent = `${data.name} ${data.event}`;
+      setTimeout(() => presenceEl.textContent = "", 1200);
+    }
+    else if (data.type === "typing") {
+      typingEl.classList.remove("hidden");
+      clearTimeout(state.typingTimeout);
+      state.typingTimeout = setTimeout(() => typingEl.classList.add("hidden"), 800);
+    }
+    else if (data.type === "message") {
       let text = data.text;
-      if (data.encrypted){ text = state.key ? await decryptMaybe(state.key, text) : "[Encrypted message]"; }
-      appendTextBubble({name:data.name, text, ts:data.ts, self:false, id:data.messageId});
-      notify(data.name, text); ws.send(JSON.stringify({type:"seen", messageId:data.messageId}));
-    } else if (data.type === "file"){
-      appendFileBubble({name:data.name, data:data.data, filename:data.filename, ts:data.ts, self:false, id:data.messageId});
-      notify(data.name, `Sent file: ${data.filename}`); ws.send(JSON.stringify({type:"seen", messageId:data.messageId}));
-    } else if (data.type === "seen"){
-      const el = state.myMsgs.get(data.messageId); if (el) el.textContent = "✨ seen";
-    } else if (data.type === "error"){ alert(data.message || "Error"); }
+      if (data.encrypted) {
+        text = state.key ? await decryptMaybe(state.key, text) : "[Encrypted message]";
+      }
+      appendTextBubble({ name: data.name, text, ts: data.ts, self: false, id: data.messageId });
+      notify(data.name, text);
+      ws.send(JSON.stringify({ type: "seen", messageId: data.messageId }));
+    }
+    else if (data.type === "file") {
+      appendFileBubble({ name: data.name, data: data.data, filename: data.filename, ts: data.ts, self: false, id: data.messageId });
+      notify(data.name, `Sent file: ${data.filename}`);
+      ws.send(JSON.stringify({ type: "seen", messageId: data.messageId }));
+    }
+    else if (data.type === "seen") {
+      const el = state.myMsgs.get(data.messageId);
+      if (el) el.textContent = "✨ seen";
+    }
+    else if (data.type === "error") {
+      alert(data.message || "Error");
+    }
   };
 });
 async function decryptMaybe(key, text){ try{ return await decryptText(key, text); }catch{return "[Encrypted]" } }
